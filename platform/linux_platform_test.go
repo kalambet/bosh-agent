@@ -46,8 +46,11 @@ func describeLinuxPlatform() {
 		monitRetryStrategy         *fakeretry.FakeRetryStrategy
 		fakeDefaultNetworkResolver *fakenet.FakeDefaultNetworkResolver
 
-		options LinuxOptions
-		logger  boshlog.Logger
+		state    *BootstrapState
+		stateErr error
+		options  LinuxOptions
+
+		logger boshlog.Logger
 	)
 
 	BeforeEach(func() {
@@ -67,6 +70,10 @@ func describeLinuxPlatform() {
 		monitRetryStrategy = fakeretry.NewFakeRetryStrategy()
 		devicePathResolver = fakedpresolv.NewFakeDevicePathResolver()
 		fakeDefaultNetworkResolver = &fakenet.FakeDefaultNetworkResolver{}
+
+		state, stateErr = NewBootstrapState(fs, "/agent-state.json")
+		Expect(stateErr).NotTo(HaveOccurred())
+
 		options = LinuxOptions{}
 
 		fs.SetGlob("/sys/bus/scsi/devices/*:0:0:0/block/*", []string{
@@ -96,6 +103,7 @@ func describeLinuxPlatform() {
 			monitRetryStrategy,
 			devicePathResolver,
 			5*time.Millisecond,
+			state,
 			options,
 			logger,
 			fakeDefaultNetworkResolver,
@@ -283,6 +291,7 @@ bosh_foobar:...`
 					monitRetryStrategy,
 					devicePathResolver,
 					5*time.Millisecond,
+					state,
 					options,
 					logger,
 					fakeDefaultNetworkResolver,
@@ -356,20 +365,80 @@ ff02::1 ip6-allnodes
 ff02::2 ip6-allrouters
 ff02::3 ip6-allhosts
 `
-		It("sets up hostname", func() {
-			platform.SetupHostname("foobar.local")
-			Expect(len(cmdRunner.RunCommands)).To(Equal(1))
-			Expect(cmdRunner.RunCommands[0]).To(Equal([]string{"hostname", "foobar.local"}))
+		Context("When running command to get hostname fails", func() {
+			It("returns an error", func() {
+				result := fakesys.FakeCmdResult{Error: errors.New("Oops!")}
+				cmdRunner.AddCmdResult("hostname foobar.local", result)
 
-			hostnameFileContent, err := fs.ReadFileString("/etc/hostname")
-			Expect(err).NotTo(HaveOccurred())
-			Expect(hostnameFileContent).To(Equal("foobar.local"))
-
-			hostsFileContent, err := fs.ReadFileString("/etc/hosts")
-			Expect(err).NotTo(HaveOccurred())
-			Expect(hostsFileContent).To(Equal(expectedEtcHosts))
+				err := platform.SetupHostname("foobar.local")
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("Setting hostname: Oops!"))
+			})
 		})
 
+		Context("When writing to the /etc/hostname file fails", func() {
+			It("returns an error", func() {
+				fs.WriteFileErrors["/etc/hostname"] = errors.New("ENXIO: disk failed")
+
+				err := platform.SetupHostname("foobar.local")
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("Writing to /etc/hostname: ENXIO: disk failed"))
+			})
+		})
+
+		Context("When writing to /etc/hosts file fails", func() {
+			It("returns an error", func() {
+				fs.WriteFileErrors["/etc/hosts"] = errors.New("ENXIO: disk failed")
+
+				err := platform.SetupHostname("foobar.local")
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("Writing to /etc/hosts: ENXIO: disk failed"))
+			})
+		})
+
+		Context("When saving bootstrap state fails", func() {
+			It("returns an error", func() {
+				fs.WriteFileErrors["/agent-state.json"] = errors.New("ENXIO: disk failed")
+
+				err := platform.SetupHostname("foobar.local")
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("Setting up hostname: Writing bootstrap state to file: ENXIO: disk failed"))
+			})
+		})
+
+		Context("When host files have not yet been configured", func() {
+			It("sets up hostname", func() {
+				platform.SetupHostname("foobar.local")
+				Expect(len(cmdRunner.RunCommands)).To(Equal(1))
+				Expect(cmdRunner.RunCommands[0]).To(Equal([]string{"hostname", "foobar.local"}))
+
+				hostnameFileContent, err := fs.ReadFileString("/etc/hostname")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(hostnameFileContent).To(Equal("foobar.local"))
+
+				hostsFileContent, err := fs.ReadFileString("/etc/hosts")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(hostsFileContent).To(Equal(expectedEtcHosts))
+			})
+		})
+
+		Context("When host files have already been configured", func() {
+			It("skips setting up hostname to prevent overriding changes made by the release author", func() {
+				platform.SetupHostname("foobar.local")
+				platform.SetupHostname("newfoo.local")
+
+				Expect(len(cmdRunner.RunCommands)).To(Equal(1))
+				Expect(cmdRunner.RunCommands[0]).To(Equal([]string{"hostname", "foobar.local"}))
+
+				hostnameFileContent, err := fs.ReadFileString("/etc/hostname")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(hostnameFileContent).To(Equal("foobar.local"))
+
+				hostsFileContent, err := fs.ReadFileString("/etc/hosts")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(hostsFileContent).To(Equal(expectedEtcHosts))
+			})
+		})
 	})
 
 	Describe("SetupLogrotate", func() {
@@ -1342,6 +1411,55 @@ Number  Start   End     Size    File system  Name             Flags
 			mounter = diskManager.FakeMounter
 		})
 
+		Context("when device real path contains /dev/mapper/ and is successfully resolved", func() {
+			BeforeEach(func() {
+				devicePathResolver.RealDevicePath = "/dev/mapper/fake-real-device-path"
+			})
+
+			Context("when UsePreformattedPersistentDisk set to false", func() {
+				It("creates the mount directory with the correct permissions", func() {
+					err := act()
+					Expect(err).ToNot(HaveOccurred())
+
+					mountPoint := fs.GetFileTestStat("/mnt/point")
+					Expect(mountPoint.FileType).To(Equal(fakesys.FakeFileTypeDir))
+					Expect(mountPoint.FileMode).To(Equal(os.FileMode(0700)))
+				})
+
+				It("returns error when creating mount directory fails", func() {
+					fs.MkdirAllError = errors.New("fake-mkdir-all-err")
+
+					err := act()
+					Expect(err).To(HaveOccurred())
+					Expect(err.Error()).To(ContainSubstring("fake-mkdir-all-err"))
+				})
+
+				It("partitions the disk", func() {
+					err := act()
+					Expect(err).ToNot(HaveOccurred())
+
+					partitions := []boshdisk.Partition{{Type: boshdisk.PartitionTypeLinux}}
+					Expect(partitioner.PartitionDevicePath).To(Equal("/dev/mapper/fake-real-device-path"))
+					Expect(partitioner.PartitionPartitions).To(Equal(partitions))
+				})
+
+				It("formats the disk", func() {
+					err := act()
+					Expect(err).ToNot(HaveOccurred())
+					Expect(formatter.FormatPartitionPaths).To(Equal([]string{"/dev/mapper/fake-real-device-path-part1"}))
+					Expect(formatter.FormatFsTypes).To(Equal([]boshdisk.FileSystemType{boshdisk.FileSystemExt4}))
+				})
+
+				It("mounts the disk", func() {
+					err := act()
+					Expect(err).ToNot(HaveOccurred())
+					Expect(mounter.MountPartitionPaths).To(Equal([]string{"/dev/mapper/fake-real-device-path-part1"}))
+					Expect(mounter.MountMountPoints).To(Equal([]string{"/mnt/point"}))
+					Expect(mounter.MountMountOptions).To(Equal([][]string{nil}))
+				})
+			})
+		})
+
 		Context("when device path is successfully resolved", func() {
 			BeforeEach(func() {
 				devicePathResolver.RealDevicePath = "fake-real-device-path"
@@ -1463,6 +1581,48 @@ Number  Start   End     Size    File system  Name             Flags
 		var mounter *fakedisk.FakeMounter
 		BeforeEach(func() {
 			mounter = diskManager.FakeMounter
+		})
+
+		Context("when device real path contains /dev/mapper/ and can be resolved", func() {
+			BeforeEach(func() {
+				devicePathResolver.RealDevicePath = "/dev/mapper/fake-real-device-path"
+			})
+
+			ItUnmountsPersistentDisk := func(expectedUnmountMountPoint string) {
+				It("returs true without an error if unmounting succeeded", func() {
+					mounter.UnmountDidUnmount = true
+
+					didUnmount, err := act()
+					Expect(err).NotTo(HaveOccurred())
+					Expect(didUnmount).To(BeTrue())
+					Expect(mounter.UnmountPartitionPathOrMountPoint).To(Equal(expectedUnmountMountPoint))
+				})
+
+				It("returs false without an error if was already unmounted", func() {
+					mounter.UnmountDidUnmount = false
+
+					didUnmount, err := act()
+					Expect(err).NotTo(HaveOccurred())
+					Expect(didUnmount).To(BeFalse())
+					Expect(mounter.UnmountPartitionPathOrMountPoint).To(Equal(expectedUnmountMountPoint))
+				})
+
+				It("returns error if unmounting fails", func() {
+					mounter.UnmountDidUnmount = false
+					mounter.UnmountErr = errors.New("fake-unmount-err")
+
+					didUnmount, err := act()
+					Expect(err).To(HaveOccurred())
+					Expect(err.Error()).To(ContainSubstring("fake-unmount-err"))
+					Expect(didUnmount).To(BeFalse())
+					Expect(mounter.UnmountPartitionPathOrMountPoint).To(Equal(expectedUnmountMountPoint))
+				})
+			}
+
+			Context("UsePreformattedPersistentDisk is set to false", func() {
+				ItUnmountsPersistentDisk("/dev/mapper/fake-real-device-path-part1") // note partition '-part1'
+			})
+
 		})
 
 		Context("when device path can be resolved", func() {
@@ -1635,6 +1795,51 @@ Number  Start   End     Size    File system  Name             Flags
 		var mounter *fakedisk.FakeMounter
 		BeforeEach(func() {
 			mounter = diskManager.FakeMounter
+		})
+
+		Context("when device real path contains /dev/mapper/ and can be resolved", func() {
+			BeforeEach(func() {
+				devicePathResolver.RealDevicePath = "/dev/mapper/fake-real-device-path"
+			})
+
+			ItChecksPersistentDiskMountPoint := func(expectedCheckedMountPoint string) {
+				Context("when checking persistent disk mount point succeeds", func() {
+					It("returns true if mount point exists", func() {
+						mounter.IsMountedResult = true
+
+						isMounted, err := act()
+						Expect(err).NotTo(HaveOccurred())
+						Expect(isMounted).To(BeTrue())
+						Expect(mounter.IsMountedDevicePathOrMountPoint).To(Equal(expectedCheckedMountPoint))
+					})
+
+					It("returns false if mount point does not exist", func() {
+						mounter.IsMountedResult = false
+
+						isMounted, err := act()
+						Expect(err).NotTo(HaveOccurred())
+						Expect(isMounted).To(BeFalse())
+						Expect(mounter.IsMountedDevicePathOrMountPoint).To(Equal(expectedCheckedMountPoint))
+					})
+				})
+
+				Context("checking persistent disk mount points fails", func() {
+					It("returns error", func() {
+						mounter.IsMountedResult = false
+						mounter.IsMountedErr = errors.New("fake-is-mounted-err")
+
+						isMounted, err := act()
+						Expect(err).To(HaveOccurred())
+						Expect(err.Error()).To(ContainSubstring("fake-is-mounted-err"))
+						Expect(isMounted).To(BeFalse())
+						Expect(mounter.IsMountedDevicePathOrMountPoint).To(Equal(expectedCheckedMountPoint))
+					})
+				})
+			}
+
+			Context("UsePreformattedPersistentDisk is set to false", func() {
+				ItChecksPersistentDiskMountPoint("/dev/mapper/fake-real-device-path-part1") // note partition '-part1'
+			})
 		})
 
 		Context("when device path can be resolved", func() {
