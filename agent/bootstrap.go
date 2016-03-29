@@ -2,6 +2,7 @@ package agent
 
 import (
 	"errors"
+	"path"
 
 	boshplatform "github.com/cloudfoundry/bosh-agent/platform"
 	boshsettings "github.com/cloudfoundry/bosh-agent/settings"
@@ -103,8 +104,16 @@ func (boot bootstrap) Run() (err error) {
 
 	for diskID := range settings.Disks.Persistent {
 		diskSettings, _ := settings.PersistentDiskSettings(diskID)
-		if err = boot.platform.MountPersistentDisk(diskSettings, boot.dirProvider.StoreDir()); err != nil {
-			return bosherr.WrapError(err, "Mounting persistent disk")
+
+		isPartitioned, err := boot.platform.IsPersistentDiskMountable(diskSettings)
+		if err != nil {
+			return bosherr.WrapError(err, "Checking if persistent disk is partitioned")
+		}
+
+		if isPartitioned {
+			if err = boot.platform.MountPersistentDisk(diskSettings, boot.dirProvider.StoreDir()); err != nil {
+				return bosherr.WrapError(err, "Mounting persistent disk")
+			}
 		}
 	}
 
@@ -114,6 +123,18 @@ func (boot bootstrap) Run() (err error) {
 
 	if err = boot.platform.StartMonit(); err != nil {
 		return bosherr.WrapError(err, "Starting monit")
+	}
+
+	if settings.Env.GetRemoveDevTools() {
+		packageFileListPath := path.Join(boot.dirProvider.EtcDir(), "dev_tools_file_list")
+
+		if !boot.fs.FileExists(packageFileListPath) {
+			return nil
+		}
+
+		if err = boot.platform.RemoveDevTools(packageFileListPath); err != nil {
+			return bosherr.WrapError(err, "Removing Development Tools Packages")
+		}
 	}
 
 	return nil

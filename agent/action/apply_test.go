@@ -2,6 +2,7 @@ package action_test
 
 import (
 	"errors"
+	"path"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -11,7 +12,10 @@ import (
 	fakeas "github.com/cloudfoundry/bosh-agent/agent/applier/applyspec/fakes"
 	fakeappl "github.com/cloudfoundry/bosh-agent/agent/applier/fakes"
 	boshsettings "github.com/cloudfoundry/bosh-agent/settings"
+	boshdir "github.com/cloudfoundry/bosh-agent/settings/directories"
 	fakesettings "github.com/cloudfoundry/bosh-agent/settings/fakes"
+	boshsys "github.com/cloudfoundry/bosh-utils/system"
+	fakesys "github.com/cloudfoundry/bosh-utils/system/fakes"
 )
 
 func init() {
@@ -20,14 +24,18 @@ func init() {
 			applier         *fakeappl.FakeApplier
 			specService     *fakeas.FakeV1Service
 			settingsService *fakesettings.FakeSettingsService
+			dirProvider     boshdir.Provider
 			action          ApplyAction
+			fs              boshsys.FileSystem
 		)
 
 		BeforeEach(func() {
 			applier = fakeappl.NewFakeApplier()
 			specService = fakeas.NewFakeV1Service()
 			settingsService = &fakesettings.FakeSettingsService{}
-			action = NewApply(applier, specService, settingsService)
+			dirProvider = boshdir.NewProvider("/var/vcap")
+			fs = fakesys.NewFakeFileSystem()
+			action = NewApply(applier, specService, settingsService, dirProvider.InstanceDir(), fs)
 		})
 
 		It("apply should be asynchronous", func() {
@@ -85,6 +93,38 @@ func init() {
 									Expect(value).To(Equal("applied"))
 
 									Expect(specService.Spec).To(Equal(populatedDesiredApplySpec))
+								})
+
+								Context("desired spec has id, instance name, deployment name, and az", func() {
+
+									BeforeEach(func() {
+										desiredApplySpec = boshas.V1ApplySpec{ConfigurationHash: "fake-desired-config-hash", NodeID: "node-id01-123f-r2344", AvailabilityZone: "ex-az", Deployment: "deployment-name", Name: "instance-name"}
+										specService.PopulateDHCPNetworksResultSpec = desiredApplySpec
+									})
+
+									It("returns 'applied' and writes the id, instance name, deployment name, and az to files in the instance directory", func() {
+										value, err := action.Run(desiredApplySpec)
+										Expect(err).ToNot(HaveOccurred())
+										Expect(value).To(Equal("applied"))
+
+										instanceDir := dirProvider.InstanceDir()
+
+										id, err := fs.ReadFileString(path.Join(instanceDir, "id"))
+										Expect(err).ToNot(HaveOccurred())
+										Expect(id).To(Equal(desiredApplySpec.NodeID))
+
+										az, err := fs.ReadFileString(path.Join(instanceDir, "az"))
+										Expect(err).ToNot(HaveOccurred())
+										Expect(az).To(Equal(desiredApplySpec.AvailabilityZone))
+
+										instanceName, err := fs.ReadFileString(path.Join(instanceDir, "name"))
+										Expect(err).ToNot(HaveOccurred())
+										Expect(instanceName).To(Equal(desiredApplySpec.Name))
+
+										deploymentName, err := fs.ReadFileString(path.Join(instanceDir, "deployment"))
+										Expect(err).ToNot(HaveOccurred())
+										Expect(deploymentName).To(Equal(desiredApplySpec.Deployment))
+									})
 								})
 							})
 
